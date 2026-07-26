@@ -4,9 +4,14 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from openai import OpenAI
+from fastapi import FastAPI, HTTPException, Query
+from openai import APIError, OpenAI
 from pydantic import BaseModel, Field, ValidationError
+
+from rag.config import get_settings, pinecone_configured
+from rag.ingest import ingest_document
+from rag.prompts import build_grounding_prompt
+from rag.pinecone_store import pinecone_health, retrieve_chunks
 
 # Load .env from this folder so the key is found regardless of shell working directory.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -40,7 +45,10 @@ class AskRequest(BaseModel):
 
     question: str
     force_bad: bool = False  # Stage 3 demo knob — first attempt breaks schema on purpose.
-    model: str | None = None  # Stage 4 — optional override to swap models live.
+    model: str | None = Field(
+        default=None,
+        description="OpenAI model override (e.g. gpt-4o-mini). Leave empty for default.",
+    )
 
 
 class AskResponse(BaseModel):
@@ -51,6 +59,48 @@ class AskResponse(BaseModel):
     model: str
     latency_ms: int
     cost_usd: float
+    retrieved_chunk_ids: list[str] = Field(default_factory=list)
+
+
+class IngestRequest(BaseModel):
+    """Upload raw text to chunk, embed, and store in Pinecone."""
+
+    text: str
+    document_id: str = Field(min_length=1)
+    source: str | None = None  # optional filename or URL
+
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_indexed: int
+    status: str
+
+
+class RetrieveChunk(BaseModel):
+    id: str
+    score: float
+    document_id: str | None = None
+    chunk_index: int | None = None
+    source: str | None = None
+    text: str | None = None
+
+
+class RetrieveResponse(BaseModel):
+    query: str
+    embedding_model: str
+    top_k: int
+    chunks: list[RetrieveChunk]
+
+
+def resolve_model(model: str | None) -> str:
+    """Use default model when client omits model or sends Swagger's placeholder value."""
+
+    if not model:
+        return DEFAULT_MODEL
+    cleaned = model.strip()
+    if cleaned.lower() in {"string", "null", "none", ""}:
+        return DEFAULT_MODEL
+    return cleaned
 
 
 def compute_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -115,45 +165,135 @@ def call_model_unsafe(question: str, model: str) -> tuple[Answer, int, int, int]
     return answer, total, prompt_tokens, completion_tokens
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/debug/pinecone")
+def debug_pinecone():
+    """Confirm Pinecone env vars are set and the index is reachable."""
+
+    return pinecone_health(client)
+
+
+# curl.exe -s "http://127.0.0.1:8000/debug/retrieve?q=What+is+an+implantable+loop+recorder+used+for"
+@app.get("/debug/retrieve", response_model=RetrieveResponse)
+def debug_retrieve(
+    q: str = Query(..., min_length=1, description="Question to embed and search in Pinecone"),
+):
+    """Embed the question and return top-5 chunks — no LLM call."""
+
+    question = q.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="q must not be empty")
+
+    if not pinecone_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Pinecone is not configured. Set PINECONE_API_KEY and PINECONE_INDEX_NAME.",
+        )
+
+    try:
+        top_k = get_settings().retrieval_top_k
+        return retrieve_chunks(client, question, top_k=top_k)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Retrieval failed: {exc}") from exc
+
+
+# curl.exe --% -s -X POST http://127.0.0.1:8000/ingest \
+#   -H "Content-Type: application/json" \
+#   -d "{\"document_id\": \"doc-001\", \"text\": \"RAG retrieves relevant document chunks before calling the LLM.\", \"source\": \"notes.txt\"}"
+@app.post("/ingest", response_model=IngestResponse)
+def ingest(body: IngestRequest) -> IngestResponse:
+    """Chunk text, embed with text-embedding-3-small, and upsert into Pinecone."""
+
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+
+    if not pinecone_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Pinecone is not configured. Set PINECONE_API_KEY and PINECONE_INDEX_NAME.",
+        )
+
+    try:
+        chunks_indexed = ingest_document(
+            client,
+            text=body.text,
+            document_id=body.document_id,
+            source=body.source,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Ingest failed: {exc}") from exc
+
+    if chunks_indexed == 0:
+        raise HTTPException(status_code=400, detail="No chunks produced from input text")
+
+    return IngestResponse(
+        document_id=body.document_id,
+        chunks_indexed=chunks_indexed,
+        status="indexed",
+    )
+
+
 @app.post("/ask")
 def ask(body: AskRequest) -> AskResponse:
-    """Answer one question with structured output, guardrails, and cost visibility."""
+    """Answer with RAG grounding when Pinecone is configured, else plain generation."""
 
-    model = body.model or DEFAULT_MODEL
+    model = resolve_model(body.model)
     last_error: str | None = None
+    retrieved_chunk_ids: list[str] = []
+    prompt = body.question
+
+    # RAG path: embed question, retrieve chunks, build grounding prompt.
+    use_rag = pinecone_configured() and not body.force_bad
+    if use_rag:
+        try:
+            top_k = get_settings().retrieval_top_k
+            retrieval = retrieve_chunks(client, body.question, top_k=top_k)
+            chunks = retrieval["chunks"]
+            retrieved_chunk_ids = [chunk["id"] for chunk in chunks]
+            prompt = build_grounding_prompt(body.question, chunks)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Retrieval failed: {exc}") from exc
 
     # Stage 3: one retry keeps the logic legible while still protecting callers.
-    for attempt in range(2):
-        try:
-            start = time.perf_counter()
+    try:
+        for attempt in range(2):
+            try:
+                start = time.perf_counter()
 
-            # First attempt with force_bad uses the unsafe path; retry uses structured output.
-            use_bad_path = body.force_bad and attempt == 0
-            if use_bad_path:
-                answer, tokens_used, prompt_tokens, completion_tokens = call_model_unsafe(
-                    body.question, model
+                # First attempt with force_bad uses the unsafe path; retry uses structured output.
+                use_bad_path = body.force_bad and attempt == 0
+                if use_bad_path:
+                    answer, tokens_used, prompt_tokens, completion_tokens = call_model_unsafe(
+                        body.question, model
+                    )
+                else:
+                    answer, tokens_used, prompt_tokens, completion_tokens = call_model_structured(
+                        prompt, model
+                    )
+
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                cost_usd = compute_cost_usd(model, prompt_tokens, completion_tokens)
+
+                return AskResponse(
+                    answer=answer,
+                    tokens_used=tokens_used,
+                    model=model,
+                    latency_ms=latency_ms,
+                    cost_usd=round(cost_usd, 6),
+                    retrieved_chunk_ids=retrieved_chunk_ids,
                 )
-            else:
-                answer, tokens_used, prompt_tokens, completion_tokens = call_model_structured(
-                    body.question, model
-                )
+            except (ValidationError, ValueError) as exc:
+                last_error = str(exc)
+                continue
 
-            latency_ms = int((time.perf_counter() - start) * 1000)
-            cost_usd = compute_cost_usd(model, prompt_tokens, completion_tokens)
-
-            return AskResponse(
-                answer=answer,
-                tokens_used=tokens_used,
-                model=model,
-                latency_ms=latency_ms,
-                cost_usd=round(cost_usd, 6),
-            )
-        except (ValidationError, ValueError) as exc:
-            last_error = str(exc)
-            continue
-
-    # Clean failure — never leak a half-parsed response to the client.
-    raise HTTPException(
-        status_code=502,
-        detail=f"Model response failed schema validation after retry: {last_error}",
-    )
+        # Clean failure — never leak a half-parsed response to the client.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Model response failed schema validation after retry: {last_error}",
+        )
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI API error: {exc}") from exc
